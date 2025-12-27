@@ -1,0 +1,304 @@
+"""
+Spark Structured Streaming for Cryptocurrency Data Processing
+Consumes from Kafka, performs feature engineering, detects anomalies,
+and writes to HDFS and MLflow
+"""
+
+import logging
+from datetime import datetime
+from typing import Optional
+
+from pyspark.sql import SparkSession, DataFrame, Window
+from pyspark.sql.functions import (
+    col, from_json, schema_of_json, to_timestamp,
+    avg, stddev, max as spark_max, min as spark_min,
+    lag, when, abs as spark_abs, lit, current_timestamp
+)
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
+
+from spark_config import (
+    BATCH_INTERVAL, HDFS_PATHS, KAFKA_BOOTSTRAP_SERVERS,
+    KAFKA_TOPICS, LOG_LEVEL, MLFLOW_EXPERIMENT_NAME,
+    MLFLOW_TRACKING_URI, WATERMARK_DELAY, WINDOW_CONFIGS,
+    ANOMALY_THRESHOLDS
+)
+
+# Configure logging
+logging.basicConfig(level=LOG_LEVEL)
+logger = logging.getLogger(__name__)
+
+
+class CryptoStreamingPipeline:
+    """Main streaming pipeline for cryptocurrency data"""
+
+    def __init__(self):
+        """Initialize Spark session and MLflow"""
+        self.spark = self._create_spark_session()
+        self._setup_mlflow()
+        self.schema = self._define_schema()
+
+    def _create_spark_session(self) -> SparkSession:
+        """Create and configure Spark session"""
+        logger.info("Creating Spark session...")
+        
+        spark = (SparkSession
+                 .builder
+                 .appName("CryptoStreamingPipeline")
+                 .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0")
+                 .config("spark.sql.streaming.checkpointLocation", "/tmp/spark_checkpoint")
+                 .config("spark.hadoop.fs.defaultFS", "hdfs://namenode:8020")
+                 .getOrCreate())
+        
+        spark.sparkContext.setLogLevel(LOG_LEVEL)
+        logger.info("✅ Spark session created successfully")
+        return spark
+
+    def _setup_mlflow(self) -> None:
+        """Setup MLflow tracking"""
+        import mlflow
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+        logger.info(f"MLflow tracking URI set to {MLFLOW_TRACKING_URI}")
+
+    def _define_schema(self) -> StructType:
+        """Define schema for cryptocurrency data"""
+        return StructType([
+            StructField("id", StringType(), True),
+            StructField("symbol", StringType(), True),
+            StructField("price", DoubleType(), True),
+            StructField("market_cap", DoubleType(), True),
+            StructField("volume", DoubleType(), True),
+            StructField("price_change_24h", DoubleType(), True),
+            StructField("last_updated", LongType(), True),
+            StructField("timestamp", StringType(), True),
+            StructField("source", StringType(), True)
+        ])
+
+    def read_kafka_stream(self, topic: str) -> DataFrame:
+        """
+        Read cryptocurrency data from Kafka
+
+        Args:
+            topic: Kafka topic name
+
+        Returns:
+            Spark DataFrame
+        """
+        logger.info(f"Reading from Kafka topic: {topic}")
+        
+        df = (self.spark
+              .readStream
+              .format("kafka")
+              .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+              .option("subscribe", topic)
+              .option("startingOffsets", "latest")
+              .option("maxOffsetsBehindLatest", "100000")
+              .load())
+
+        # Parse JSON data
+        df_parsed = (df
+                     .select(from_json(col("value").cast("string"), self.schema).alias("data"))
+                     .select("data.*")
+                     .withColumn("event_timestamp", to_timestamp(col("timestamp"))))
+
+        logger.info("✅ Kafka stream reader configured")
+        return df_parsed
+
+    def data_cleaning(self, df: DataFrame) -> DataFrame:
+        """
+        Clean and validate cryptocurrency data
+
+        Args:
+            df: Input DataFrame
+
+        Returns:
+            Cleaned DataFrame
+        """
+        logger.info("Applying data cleaning transformations...")
+
+        cleaned_df = (df
+                      .filter(col("price").isNotNull())
+                      .filter(col("price") > 0)
+                      .filter(col("symbol").isNotNull())
+                      .dropDuplicates(["symbol", "timestamp"])
+                      .withColumn("price_usd", col("price"))
+                      .withColumn("volume_usd", col("volume"))
+                      .withColumn("market_cap_usd", col("market_cap"))
+                      .withColumn("processed_timestamp", current_timestamp()))
+
+        return cleaned_df
+
+    def feature_engineering(self, df: DataFrame) -> DataFrame:
+        """
+        Perform feature engineering: moving averages, volatility, etc.
+
+        Args:
+            df: Cleaned DataFrame
+
+        Returns:
+            DataFrame with engineered features
+        """
+        logger.info("Performing feature engineering...")
+
+        # Define window specifications
+        window_1min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-60, 0)
+        window_5min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-300, 0)
+        window_15min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-900, 0)
+
+        features_df = (df
+                       # 1-minute moving average
+                       .withColumn("ma_1min", avg("price").over(window_1min))
+                       # 5-minute moving average
+                       .withColumn("ma_5min", avg("price").over(window_5min))
+                       # 15-minute moving average
+                       .withColumn("ma_15min", avg("price").over(window_15min))
+                       # Volatility (1-minute)
+                       .withColumn("volatility_1min", stddev("price").over(window_1min))
+                       # Volume change
+                       .withColumn("prev_volume", lag("volume").over(Window.partitionBy("symbol").orderBy("event_timestamp")))
+                       .withColumn("volume_change_pct", 
+                                  when(col("prev_volume").isNotNull(),
+                                       ((col("volume") - col("prev_volume")) / col("prev_volume")) * 100)
+                                  .otherwise(0)))
+
+        return features_df
+
+    def detect_anomalies(self, df: DataFrame) -> DataFrame:
+        """
+        Detect market anomalies (pump & dump, volume spikes, etc.)
+
+        Args:
+            df: DataFrame with features
+
+        Returns:
+            DataFrame with anomaly flags
+        """
+        logger.info("Applying anomaly detection...")
+
+        z_score_threshold = ANOMALY_THRESHOLDS['z_score']
+        volume_threshold = ANOMALY_THRESHOLDS['volume_spike']
+
+        anomaly_df = (df
+                      # Z-score normalization
+                      .withColumn("price_mean", avg("price").over(Window.partitionBy("symbol")))
+                      .withColumn("price_stddev", stddev("price").over(Window.partitionBy("symbol")))
+                      .withColumn("price_zscore",
+                                 (col("price") - col("price_mean")) / (col("price_stddev") + 0.0001))
+                      # Anomaly flags
+                      .withColumn("is_price_anomaly",
+                                 spark_abs(col("price_zscore")) > z_score_threshold)
+                      .withColumn("is_volume_anomaly",
+                                 col("volume_change_pct") > (volume_threshold * 100))
+                      .withColumn("is_anomaly",
+                                 col("is_price_anomaly") | col("is_volume_anomaly"))
+                      .withColumn("anomaly_score",
+                                 when(col("is_price_anomaly"), spark_abs(col("price_zscore")))
+                                 .when(col("is_volume_anomaly"), col("volume_change_pct"))
+                                 .otherwise(0)))
+
+        return anomaly_df
+
+    def write_to_hdfs(self, df: DataFrame, path: str, checkpoint_id: str) -> None:
+        """
+        Write streaming data to HDFS in Parquet format
+
+        Args:
+            df: DataFrame to write
+            path: HDFS path
+            checkpoint_id: Unique checkpoint identifier
+        """
+        query = (df
+                 .writeStream
+                 .format("parquet")
+                 .mode("append")
+                 .option("path", path)
+                 .option("checkpointLocation", f"/tmp/checkpoint_{checkpoint_id}")
+                 .partitionBy("symbol")
+                 .start())
+
+        logger.info(f"✅ Writing to HDFS: {path}")
+        return query
+
+    def write_alerts_to_kafka(self, df: DataFrame) -> None:
+        """
+        Write anomalies as alerts to Kafka
+
+        Args:
+            df: DataFrame with anomalies
+        """
+        alerts_df = (df
+                     .filter(col("is_anomaly") == True)
+                     .select(
+                         col("symbol"),
+                         col("price"),
+                         col("anomaly_score"),
+                         col("is_price_anomaly"),
+                         col("is_volume_anomaly"),
+                         col("event_timestamp"),
+                         lit("ALERT").alias("event_type")
+                     ))
+
+        query = (alerts_df
+                 .select(
+                     col("*").cast("string").alias("value")
+                 )
+                 .writeStream
+                 .format("kafka")
+                 .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+                 .option("topic", KAFKA_TOPICS['alerts'])
+                 .option("checkpointLocation", "/tmp/checkpoint_alerts")
+                 .start())
+
+        logger.info(f"✅ Alert stream writer configured for {KAFKA_TOPICS['alerts']}")
+        return query
+
+    def run_pipeline(self) -> None:
+        """Execute the complete streaming pipeline"""
+        try:
+            logger.info("=" * 60)
+            logger.info("🚀 Starting Crypto Streaming Pipeline")
+            logger.info("=" * 60)
+
+            # Read raw data from Kafka
+            raw_df = self.read_kafka_stream(KAFKA_TOPICS['raw'])
+
+            # Clean data
+            clean_df = self.data_cleaning(raw_df)
+
+            # Apply watermarking for stateful operations
+            clean_df = clean_df.withWatermark("event_timestamp", WATERMARK_DELAY)
+
+            # Feature engineering
+            features_df = self.feature_engineering(clean_df)
+
+            # Anomaly detection
+            final_df = self.detect_anomalies(features_df)
+
+            # Write clean data to HDFS
+            query_clean = self.write_to_hdfs(clean_df, HDFS_PATHS['clean'], "clean")
+
+            # Write features to HDFS
+            query_features = self.write_to_hdfs(features_df, HDFS_PATHS['features'], "features")
+
+            # Write alerts to Kafka
+            query_alerts = self.write_alerts_to_kafka(final_df)
+
+            # Wait for all queries
+            logger.info("\n📡 Streaming pipeline active. Press Ctrl+C to stop.\n")
+            self.spark.streams.awaitAnyTermination()
+
+        except Exception as e:
+            logger.error(f"Pipeline error: {e}", exc_info=True)
+        finally:
+            logger.info("Stopping streaming context...")
+            self.spark.stop()
+
+
+def main():
+    """Main entry point"""
+    pipeline = CryptoStreamingPipeline()
+    pipeline.run_pipeline()
+
+
+if __name__ == "__main__":
+    main()
