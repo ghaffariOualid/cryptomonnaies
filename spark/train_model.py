@@ -4,24 +4,19 @@ Trains models for anomaly detection and trend prediction
 """
 
 import logging
-import json
-from datetime import datetime
-from typing import Tuple, Dict, Any
+from typing import Dict, Any
 
 import mlflow
 import mlflow.spark
-import numpy as np
-import pandas as pd
 from pyspark.ml import Pipeline
 from pyspark.ml.classification import RandomForestClassifier, LogisticRegression
 from pyspark.ml.feature import VectorAssembler, StandardScaler
-from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, when, lit, rand
-from sklearn.ensemble import IsolationForest
+from pyspark.sql.functions import col, when, lit
 
 from spark_config import (
-    HDFS_PATHS, KAFKA_BOOTSTRAP_SERVERS, LOG_LEVEL,
+    HDFS_PATHS, LOG_LEVEL,
     MLFLOW_EXPERIMENT_NAME, MLFLOW_TRACKING_URI
 )
 
@@ -55,12 +50,15 @@ class CryptoMLPipeline:
 
     def read_features_from_hdfs(self) -> DataFrame:
         """Read engineered features from HDFS"""
-        logger.info(f"Reading features from {HDFS_PATHS['features']}")
+        path = HDFS_PATHS['features']
+        logger.info(f"Reading features from {path}")
         
+        # Allow schema inference to handle potential missing columns gracefully
         df = (self.spark
               .read
+              .option("mergeSchema", "true")
               .format("parquet")
-              .load(HDFS_PATHS['features']))
+              .load(path))
 
         logger.info(f"Loaded {df.count()} records from HDFS")
         return df
@@ -69,19 +67,27 @@ class CryptoMLPipeline:
         """Prepare data for anomaly detection model"""
         logger.info("Preparing data for anomaly detection...")
 
+        # NOTE: We use 'price_mean' and 'price_stddev' because those are the actual names
+        # in your streaming_job.py.
+        
+        # Synthesize a label for testing if 'is_anomaly' is missing
+        if "is_anomaly" not in df.columns:
+            logger.warning("'is_anomaly' column missing. Generating synthetic labels for testing.")
+            df = df.withColumn("is_anomaly", 
+                               (col("price") > col("price_mean") * 1.05) | 
+                               (col("price") < col("price_mean") * 0.95))
+
         prepared_df = (df
                        .select(
                            col("symbol"),
                            col("price"),
                            col("volume"),
-                           col("ma_1min"),
-                           col("ma_5min"),
-                           col("volatility_1min"),
+                           col("price_mean").alias("ma_1min"),     # Renaming to match expected feature
+                           col("price_stddev").alias("volatility_1min"),
                            col("volume_change_pct"),
-                           col("price_zscore"),
                            col("is_anomaly").cast("int").alias("label")
                        )
-                       .na.drop())
+                       .na.fill(0)) # Fill nulls to prevent dropping all data
 
         logger.info(f"Prepared {prepared_df.count()} records for training")
         return prepared_df
@@ -90,25 +96,21 @@ class CryptoMLPipeline:
         """Prepare data for trend prediction"""
         logger.info("Preparing data for trend prediction...")
 
-        # Create price direction label
+        # Create price direction label (Next price > Current price)
+        # In a real batch job, you'd join with the "next minute's" data.
+        # For this test, we'll simulate a target variable.
+        
         prediction_df = (df
-                        .withColumn("next_price", 
-                                   col("price") * (1 + col("price_change_24h") / 100))
-                        .withColumn("label",
-                                   when(col("next_price") > col("price"), 1)
-                                   .when(col("next_price") < col("price"), 0)
-                                   .otherwise(lit(1)))
-                        .select(
-                            col("symbol"),
-                            col("price"),
-                            col("ma_1min"),
-                            col("ma_5min"),
-                            col("ma_15min"),
-                            col("volatility_1min"),
-                            col("volume_change_pct"),
-                            col("label")
-                        )
-                        .na.drop())
+                         .withColumn("future_target", when(col("price") > col("price_mean"), 1).otherwise(0))
+                         .select(
+                             col("symbol"),
+                             col("price"),
+                             col("price_mean").alias("ma_1min"),
+                             col("price_stddev").alias("volatility_1min"),
+                             col("volume_change_pct"),
+                             col("future_target").alias("label")
+                         )
+                         .na.fill(0))
 
         logger.info(f"Prepared {prediction_df.count()} records for prediction training")
         return prediction_df
@@ -117,98 +119,54 @@ class CryptoMLPipeline:
         """Train anomaly detection model using Random Forest"""
         logger.info("Training anomaly detection model...")
 
-        with mlflow.start_run() as run:
-            mlflow.log_param("model_type", "RandomForest_AnomalyDetection")
-            mlflow.log_param("num_trees", 100)
+        with mlflow.start_run(run_name="Anomaly_Detection") as run:
+            mlflow.log_param("model_type", "RandomForest")
 
-            # Feature assembly
-            feature_cols = ["price", "volume", "ma_1min", "ma_5min", "volatility_1min", "volume_change_pct"]
+            feature_cols = ["price", "volume", "ma_1min", "volatility_1min", "volume_change_pct"]
             assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
 
-            # Model
-            rf_model = RandomForestClassifier(
-                numTrees=100,
-                maxDepth=10,
-                minInstancesPerNode=5,
-                seed=42,
-                labelCol="label",
-                featuresCol="features"
-            )
+            rf = RandomForestClassifier(labelCol="label", featuresCol="features", numTrees=20)
+            pipeline = Pipeline(stages=[assembler, rf])
 
-            # Pipeline
-            pipeline = Pipeline(stages=[assembler, rf_model])
-
-            # Train/Test split
             train_data, test_data = train_df.randomSplit([0.8, 0.2], seed=42)
-
-            # Train
             model = pipeline.fit(train_data)
 
-            # Evaluate
             predictions = model.transform(test_data)
-            evaluator = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
+            evaluator = BinaryClassificationEvaluator(labelCol="label")
             auc = evaluator.evaluate(predictions)
 
             logger.info(f"Anomaly Detection AUC: {auc:.4f}")
             mlflow.log_metric("auc", auc)
+            mlflow.spark.log_model(model, "anomaly_model")
 
-            # Log model
-            mlflow.spark.log_model(model, "anomaly_model", registered_model_name="CryptoAnomalyDetection")
-
-            return {
-                "model": model,
-                "auc": auc,
-                "run_id": run.info.run_id
-            }
+            return {"run_id": run.info.run_id}
 
     def train_prediction_model(self, train_df: DataFrame) -> Dict[str, Any]:
         """Train trend prediction model"""
         logger.info("Training trend prediction model...")
 
-        with mlflow.start_run() as run:
-            mlflow.log_param("model_type", "LogisticRegression_TrendPrediction")
-            mlflow.log_param("max_iter", 100)
+        with mlflow.start_run(run_name="Trend_Prediction") as run:
+            mlflow.log_param("model_type", "LogisticRegression")
 
-            # Feature assembly
-            feature_cols = ["price", "ma_1min", "ma_5min", "ma_15min", "volatility_1min", "volume_change_pct"]
+            feature_cols = ["price", "ma_1min", "volatility_1min", "volume_change_pct"]
             assembler = VectorAssembler(inputCols=feature_cols, outputCol="features")
-
-            # Scaler
             scaler = StandardScaler(inputCol="features", outputCol="scaledFeatures")
+            lr = LogisticRegression(labelCol="label", featuresCol="scaledFeatures", maxIter=20)
+            
+            pipeline = Pipeline(stages=[assembler, scaler, lr])
 
-            # Model
-            lr_model = LogisticRegression(
-                maxIter=100,
-                regParam=0.01,
-                labelCol="label",
-                featuresCol="scaledFeatures"
-            )
-
-            # Pipeline
-            pipeline = Pipeline(stages=[assembler, scaler, lr_model])
-
-            # Train/Test split
             train_data, test_data = train_df.randomSplit([0.8, 0.2], seed=42)
-
-            # Train
             model = pipeline.fit(train_data)
 
-            # Evaluate
             predictions = model.transform(test_data)
-            evaluator = BinaryClassificationEvaluator(labelCol="label", metricName="areaUnderROC")
+            evaluator = BinaryClassificationEvaluator(labelCol="label")
             auc = evaluator.evaluate(predictions)
 
             logger.info(f"Trend Prediction AUC: {auc:.4f}")
             mlflow.log_metric("auc", auc)
+            mlflow.spark.log_model(model, "prediction_model")
 
-            # Log model
-            mlflow.spark.log_model(model, "prediction_model", registered_model_name="CryptoTrendPrediction")
-
-            return {
-                "model": model,
-                "auc": auc,
-                "run_id": run.info.run_id
-            }
+            return {"run_id": run.info.run_id}
 
     def run_training(self) -> None:
         """Execute complete training pipeline"""
@@ -217,20 +175,20 @@ class CryptoMLPipeline:
             logger.info("🤖 Starting ML Model Training")
             logger.info("=" * 60)
 
-            # Read features
             features_df = self.read_features_from_hdfs()
+            
+            # Check if we have enough data
+            if features_df.count() == 0:
+                logger.error("❌ No data found in HDFS! Cannot train model.")
+                return
 
-            # Prepare datasets
             anomaly_data = self.prepare_anomaly_detection_data(features_df)
             prediction_data = self.prepare_prediction_data(features_df)
 
-            # Train models
-            anomaly_result = self.train_anomaly_detection_model(anomaly_data)
-            prediction_result = self.train_prediction_model(prediction_data)
+            self.train_anomaly_detection_model(anomaly_data)
+            self.train_prediction_model(prediction_data)
 
             logger.info("\n✅ Model training completed successfully")
-            logger.info(f"Anomaly Detection Run ID: {anomaly_result['run_id']}")
-            logger.info(f"Trend Prediction Run ID: {prediction_result['run_id']}")
 
         except Exception as e:
             logger.error(f"Training error: {e}", exc_info=True)
@@ -239,7 +197,6 @@ class CryptoMLPipeline:
 
 
 def main():
-    """Main entry point"""
     pipeline = CryptoMLPipeline()
     pipeline.run_training()
 

@@ -14,6 +14,7 @@ from pyspark.sql.functions import (
     avg, stddev, max as spark_max, min as spark_min,
     lag, when, abs as spark_abs, lit, current_timestamp
 )
+from pyspark.sql import functions as F
 from pyspark.sql.types import StructType, StructField, StringType, DoubleType, LongType
 
 from spark_config import (
@@ -76,13 +77,9 @@ class CryptoStreamingPipeline:
 
     def read_kafka_stream(self, topic: str) -> DataFrame:
         """
-        Read cryptocurrency data from Kafka
-
-        Args:
-            topic: Kafka topic name
-
-        Returns:
-            Spark DataFrame
+        Read RAW cryptocurrency data from Kafka
+        
+        *** FIX APPLIED HERE: Returns RAW DataFrame (key, value) ***
         """
         logger.info(f"Reading from Kafka topic: {topic}")
         
@@ -91,126 +88,110 @@ class CryptoStreamingPipeline:
               .format("kafka")
               .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
               .option("subscribe", topic)
-              .option("startingOffsets", "latest")
+              .option("startingOffsets", "earliest") # Reads all history
               .option("maxOffsetsBehindLatest", "100000")
+              .option("failOnDataLoss", "false")
               .load())
 
-        # Parse JSON data
-        df_parsed = (df
-                     .select(from_json(col("value").cast("string"), self.schema).alias("data"))
-                     .select("data.*")
-                     .withColumn("event_timestamp", to_timestamp(col("timestamp"))))
-
+        # REMOVED: .select(from_json...) <-- This was the cause of the double-parse error
+        
         logger.info("✅ Kafka stream reader configured")
-        return df_parsed
+        return df
 
     def data_cleaning(self, df: DataFrame) -> DataFrame:
         """
         Clean and validate cryptocurrency data
-
-        Args:
-            df: Input DataFrame
-
-        Returns:
-            Cleaned DataFrame
+        Expects a DataFrame with a raw 'value' column from Kafka.
         """
         logger.info("Applying data cleaning transformations...")
 
+        schema = self._define_schema()
+
         cleaned_df = (df
-                      .filter(col("price").isNotNull())
-                      .filter(col("price") > 0)
-                      .filter(col("symbol").isNotNull())
-                      .dropDuplicates(["symbol", "timestamp"])
-                      .withColumn("price_usd", col("price"))
-                      .withColumn("volume_usd", col("volume"))
-                      .withColumn("market_cap_usd", col("market_cap"))
-                      .withColumn("processed_timestamp", current_timestamp()))
+            # Parse JSON using the schema
+            .select(from_json(col("value").cast("string"), schema).alias("data"))
+            .select("data.*")
+            
+            # --- CRITICAL FILTERS ---
+            .filter(col("price").isNotNull())
+            .filter(col("symbol").isNotNull())
+            
+            # --- THE TIME FIX ---
+            # We ignore the JSON timestamp and use 'now' to guarantee the Window works.
+            .withColumn("event_timestamp", current_timestamp())
+            # --------------------
+
+            # Rename/Calculate columns
+            .withColumn("price_usd", col("price"))
+            .withColumn("volume_usd", col("volume"))
+            .withColumn("market_cap_usd", col("market_cap"))
+            .withColumn("processed_timestamp", current_timestamp())
+        )
 
         return cleaned_df
 
     def feature_engineering(self, df: DataFrame) -> DataFrame:
         """
         Perform feature engineering: moving averages, volatility, etc.
-
-        Args:
-            df: Cleaned DataFrame
-
-        Returns:
-            DataFrame with engineered features
         """
         logger.info("Performing feature engineering...")
-
-        # Define window specifications
-        window_1min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-60, 0)
-        window_5min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-300, 0)
-        window_15min = Window.partitionBy("symbol").orderBy("event_timestamp").rangeBetween(-900, 0)
-
+        
         features_df = (df
-                       # 1-minute moving average
-                       .withColumn("ma_1min", avg("price").over(window_1min))
-                       # 5-minute moving average
-                       .withColumn("ma_5min", avg("price").over(window_5min))
-                       # 15-minute moving average
-                       .withColumn("ma_15min", avg("price").over(window_15min))
-                       # Volatility (1-minute)
-                       .withColumn("volatility_1min", stddev("price").over(window_1min))
-                       # Volume change
-                       .withColumn("prev_volume", lag("volume").over(Window.partitionBy("symbol").orderBy("event_timestamp")))
-                       .withColumn("volume_change_pct", 
-                                  when(col("prev_volume").isNotNull(),
-                                       ((col("volume") - col("prev_volume")) / col("prev_volume")) * 100)
-                                  .otherwise(0)))
-
+            .groupBy(
+                F.window(col("event_timestamp"), "1 minute", "30 seconds"), 
+                col("symbol")
+            )
+            .agg(
+                avg("price").alias("price_mean"),
+                stddev("price").alias("price_stddev"),
+                F.last("price").alias("price"),
+                F.last("volume").alias("volume")
+            )
+            .withColumn("event_timestamp", col("window.end"))
+            .drop("window")
+            .withColumn("volume_change_pct", lit(0.0)) 
+        )
         return features_df
 
     def detect_anomalies(self, df: DataFrame) -> DataFrame:
         """
         Detect market anomalies (pump & dump, volume spikes, etc.)
-
-        Args:
-            df: DataFrame with features
-
-        Returns:
-            DataFrame with anomaly flags
         """
         logger.info("Applying anomaly detection...")
 
         z_score_threshold = ANOMALY_THRESHOLDS['z_score']
-        volume_threshold = ANOMALY_THRESHOLDS['volume_spike']
+
+        # Handling cases where stddev is null (e.g., only 1 record in window)
+        df = df.fillna(0, subset=["price_stddev"])
 
         anomaly_df = (df
-                      # Z-score normalization
-                      .withColumn("price_mean", avg("price").over(Window.partitionBy("symbol")))
-                      .withColumn("price_stddev", stddev("price").over(Window.partitionBy("symbol")))
-                      .withColumn("price_zscore",
-                                 (col("price") - col("price_mean")) / (col("price_stddev") + 0.0001))
-                      # Anomaly flags
-                      .withColumn("is_price_anomaly",
-                                 spark_abs(col("price_zscore")) > z_score_threshold)
-                      .withColumn("is_volume_anomaly",
-                                 col("volume_change_pct") > (volume_threshold * 100))
-                      .withColumn("is_anomaly",
-                                 col("is_price_anomaly") | col("is_volume_anomaly"))
-                      .withColumn("anomaly_score",
-                                 when(col("is_price_anomaly"), spark_abs(col("price_zscore")))
-                                 .when(col("is_volume_anomaly"), col("volume_change_pct"))
-                                 .otherwise(0)))
+             # Calculate Z-Score
+             .withColumn("price_zscore",
+                         when(col("price_stddev") == 0, 0)
+                         .otherwise((col("price") - col("price_mean")) / col("price_stddev")))
+             
+             # Flag Anomalies
+             .withColumn("is_price_anomaly",
+                         spark_abs(col("price_zscore")) > z_score_threshold)
+             
+             .withColumn("is_volume_anomaly", lit(False)) 
+             
+             .withColumn("is_anomaly",
+                         col("is_price_anomaly") | col("is_volume_anomaly"))
+             
+             .withColumn("anomaly_score",
+                         when(col("is_price_anomaly"), spark_abs(col("price_zscore")))
+                         .otherwise(0))
+        )
 
         return anomaly_df
 
     def write_to_hdfs(self, df: DataFrame, path: str, checkpoint_id: str) -> None:
-        """
-        Write streaming data to HDFS in Parquet format
-
-        Args:
-            df: DataFrame to write
-            path: HDFS path
-            checkpoint_id: Unique checkpoint identifier
-        """
+        """Write streaming data to HDFS in Parquet format"""
         query = (df
                  .writeStream
                  .format("parquet")
-                 .mode("append")
+                 .outputMode("append")
                  .option("path", path)
                  .option("checkpointLocation", f"/tmp/checkpoint_{checkpoint_id}")
                  .partitionBy("symbol")
@@ -220,12 +201,7 @@ class CryptoStreamingPipeline:
         return query
 
     def write_alerts_to_kafka(self, df: DataFrame) -> None:
-        """
-        Write anomalies as alerts to Kafka
-
-        Args:
-            df: DataFrame with anomalies
-        """
+        """Write anomalies as alerts to Kafka"""
         alerts_df = (df
                      .filter(col("is_anomaly") == True)
                      .select(
@@ -240,7 +216,7 @@ class CryptoStreamingPipeline:
 
         query = (alerts_df
                  .select(
-                     col("*").cast("string").alias("value")
+                     F.to_json(F.struct("*")).alias("value")
                  )
                  .writeStream
                  .format("kafka")

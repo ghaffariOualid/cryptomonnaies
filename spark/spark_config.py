@@ -25,7 +25,7 @@ HDFS_PATHS = {
 # Spark Streaming Configuration
 SPARK_APP_NAME = "CryptoStreamingPipeline"
 BATCH_INTERVAL = 30  # seconds
-WATERMARK_DELAY = "10 minutes"
+WATERMARK_DELAY = "0 seconds"
 
 # Feature Engineering Windows
 WINDOW_CONFIGS = {

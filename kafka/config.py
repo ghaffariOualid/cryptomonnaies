@@ -24,7 +24,7 @@ COINGECKO_VS_CURRENCY = 'usd'
 COINGECKO_INCLUDE_FIELDS = 'market_cap,market_cap_rank,total_volume,high_24h,low_24h,price_change_24h,price_change_percentage_24h'
 
 # Polling Configuration
-POLLING_INTERVAL = int(os.getenv('COINGECKO_API_POLLING_INTERVAL', 60))
+POLLING_INTERVAL = int(os.getenv('COINGECKO_API_POLLING_INTERVAL', 10))
 
 # Producer Configuration
 PRODUCER_CONFIG = {

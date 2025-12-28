@@ -42,30 +42,32 @@ services:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
 
-  # Hadoop Namenode
+  # REAL Hadoop Namenode
   namenode:
-    image: python:3.9-slim
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
     container_name: namenode
+    restart: always
     ports:
       - "9870:9870"
+      - "9000:9000"
       - "8020:8020"
-    working_dir: /app
     volumes:
-      - namenode:/data
-    command: sleep 3600
+      - namenode:/hadoop/dfs/name
+      - ./hdfs:/hdfs_scripts  # <--- MOUNT YOUR SCRIPT FOLDER HERE
+    env_file:
+      - ./hadoop.env
 
-  # Hadoop Datanode
+  # REAL Hadoop Datanode
   datanode:
-    image: python:3.9-slim
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
     container_name: datanode
+    restart: always
+    volumes:
+      - datanode:/hadoop/dfs/data
+    env_file:
+      - ./hadoop.env
     depends_on:
       - namenode
-    ports:
-      - "9864:9864"
-    working_dir: /app
-    volumes:
-      - datanode:/data
-    command: sleep 3600
 
   # Spark Master
   spark-master:
@@ -148,9 +150,27 @@ services:
       HDFS_NAMENODE: hdfs://namenode:8020
       MLFLOW_TRACKING_URI: http://mlflow:5000
     volumes:
-      - ./spark:/app/spark
+      - ./spark:/app
       - ./hdfs:/data
     restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ./dashboard
+      dockerfile: Dockerfile
+    container_name: dashboard
+    ports:
+      - "8501:8501"
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+    volumes:
+      - ./dashboard:/app
+      - ./hdfs:/data  # <--- THIS IS KEY: Access HDFS files locally
+    depends_on:
+      - kafka
+      - namenode
+      - mlflow
 
 volumes:
   zookeeper_data:

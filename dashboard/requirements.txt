@@ -1,0 +1,8 @@
+streamlit
+kafka-python
+pandas
+plotly
+pyarrow
+fastparquet
+mlflow
+watchdog

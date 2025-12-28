@@ -1,0 +1,8 @@
+v1
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=RIPPLE/part-00051-18058f52-4641-4133-a974-61c4be1a831d.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934525166,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=BITCOIN/part-00083-f3192c18-3f1e-484c-92c8-4350afd82478.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934526218,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=POLKADOT/part-00095-5fa4d1bc-7b38-4d00-a69a-563ccce6d436.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934526142,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=AAVE/part-00110-3f937dcb-857e-4133-9882-edb06bdbabc1.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934526616,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=UNISWAP/part-00158-d4f64f4d-8d60-457d-8778-fbee087f55b9.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934528734,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=LITECOIN/part-00185-fb5d09d3-56c8-4b57-a52c-2c38ed957a74.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934529701,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=SOLANA/part-00190-1e126a7b-f1b3-4b5f-9061-d3ba0d8bc2ea.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934529458,"blockReplication":3,"blockSize":134217728,"action":"add"}

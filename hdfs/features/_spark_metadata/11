@@ -1,0 +1,6 @@
+v1
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=CARDANO/part-00047-2e64296b-0f5f-456c-8013-8a9aceb88ba9.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934470785,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=CHAINLINK/part-00055-aea15a06-251d-458a-a9b3-e61ba74747af.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934470960,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=BITCOIN/part-00087-0d49b4b9-fc96-4406-bf5a-31309eb09341.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934471559,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=ETHEREUM/part-00116-5506ad20-3f13-4de6-b120-15666cdd3087.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934472867,"blockReplication":3,"blockSize":134217728,"action":"add"}
+{"path":"hdfs://namenode:8020/data/crypto/features/symbol=AAVE/part-00193-9f8f861b-c9bd-4bfb-ad50-8ce10bb54c64.c000.snappy.parquet","size":1816,"isDir":false,"modificationTime":1766934474708,"blockReplication":3,"blockSize":134217728,"action":"add"}
